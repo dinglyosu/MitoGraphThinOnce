@@ -102,6 +102,12 @@ void SaveImageData(vtkSmartPointer<vtkImageData> Image, const char FileName[], b
         printf("Saving ImageData File...\n");
     #endif
 
+    vtkSmartPointer<vtkImageFlip> Flip = vtkSmartPointer<vtkImageFlip>::New();
+    Flip -> SetInputData(Image);
+    Flip -> SetFilteredAxis(1);
+    Flip -> PreserveImageExtentOn();
+    Flip -> Update();
+
     vtkSmartPointer<vtkTIFFWriter> writer = vtkSmartPointer<vtkTIFFWriter>::New();
     writer -> SetFileName(FileName);
 
@@ -111,7 +117,7 @@ void SaveImageData(vtkSmartPointer<vtkImageData> Image, const char FileName[], b
         double range[2];
         Image -> GetScalarRange( range );
         vtkSmartPointer<vtkImageShiftScale> ShiftFilter = vtkSmartPointer<vtkImageShiftScale>::New();
-        ShiftFilter -> SetInputData(Image);
+        ShiftFilter -> SetInputData(Flip->GetOutput());
         ShiftFilter -> SetScale( 65535./(range[1]-range[0]));
         ShiftFilter -> SetShift( -range[0] );
         ShiftFilter -> SetOutputScalarTypeToUnsignedShort();
@@ -128,7 +134,7 @@ void SaveImageData(vtkSmartPointer<vtkImageData> Image, const char FileName[], b
             vtkSmartPointer<vtkImageResample> Resample = vtkSmartPointer<vtkImageResample>::New();
             Resample -> SetInterpolationModeToLinear();
             Resample -> SetDimensionality(3);
-            Resample -> SetInputData(Image);
+            Resample -> SetInputData(Flip->GetOutput());
             Resample -> SetAxisMagnificationFactor(0,1.0);
             Resample -> SetAxisMagnificationFactor(1,1.0);
             Resample -> SetAxisMagnificationFactor(2,_dz/_dxy);
@@ -140,7 +146,7 @@ void SaveImageData(vtkSmartPointer<vtkImageData> Image, const char FileName[], b
             writer -> SetInputData(ImageResampled);
         } else {
 
-            writer -> SetInputData(Image);
+            writer -> SetInputData(Flip->GetOutput());
 
         }
         
@@ -416,6 +422,7 @@ vtkSmartPointer<vtkPolyData> Thinning3D(vtkSmartPointer<vtkImageData> ImageData,
     GetVolumeFromVoxels(ImageData,&mitoObject->attributes);
 
     int x, y, z;
+    int count_thin = 0;
     double r[3], v, vl;
     vtkIdType ndels, id;
     ssThinVox *STV = new ssThinVox();
@@ -439,6 +446,7 @@ vtkSmartPointer<vtkPolyData> Thinning3D(vtkSmartPointer<vtkImageData> ImageData,
     std::list<vtkIdType>::iterator itId;
 
     do {
+        count_thin = count_thin + 1;
         ndels = 0;
         for (id = N; id--;) {
             if (IsBorder(id, ImageData)) {
@@ -476,7 +484,7 @@ vtkSmartPointer<vtkPolyData> Thinning3D(vtkSmartPointer<vtkImageData> ImageData,
 
         OnTheSurface.clear();
 
-    } while(ndels);
+    } while(ndels>0 & count_thin<1);
     
     delete STV;
 
@@ -634,345 +642,8 @@ vtkSmartPointer<vtkPolyData> Skeletonization(vtkSmartPointer<vtkImageData> Image
         SaveImageData(Image,(mitoObject->FileName+"_thinned.tif").c_str());
     #endif
 
-    double r[3];
-    int x, y, z;
-    vtkIdType id;
-    long int junction_label = 1;
-    vtkIdType N = Image -> GetNumberOfPoints();
-    std::list<vtkIdType> Junctions;
-    std::list<vtkIdType>::iterator itId;
-
-    // Inside this IF statement, isolated voxels and isolated pairs of voxels
-    // are expanded. If this is not done, these voxels will not be detected.
-    // This requires O(N).
-    if (_improve_skeleton_quality) {
-
-        #ifdef DEBUG
-            printf("Improving skeletonization [step 1: isolated single and pair of voxels]\n");
-        #endif
-
-        char nn;
-        double rn[3];
-        vtkIdType idn;
-        int xn, yn, zn;
-        for (id = N; id--;) {
-            Image -> GetPoint(id,r);
-            x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-            if (Image->GetScalarComponentAsDouble(x,y,z,0)) {
-                nn = GetNumberOfNeighborsWithoutValue(Image,x,y,z,0);
-                if (nn==0) {
-                    // Expanding isolated voxel
-                    Image -> SetScalarComponentFromDouble(x+1,y,z,0,255);
-                    Image -> SetScalarComponentFromDouble(x-1,y,z,0,255);
-                } else if (nn==1) {
-                    idn = GetOneNeighborWithoutValue(x,y,z,Image,0);
-                    Image -> GetPoint(idn,rn);
-                    xn = (int)rn[0]; yn = (int)rn[1]; zn = (int)rn[2];
-                    if (GetNumberOfNeighborsWithoutValue(Image,xn,yn,zn,0)==1) {
-                        // Expanding isolated pair of voxels
-                        Image -> SetScalarComponentFromDouble(x-(int)(rn[0]-r[0]),y-(int)(rn[1]-r[1]),z-(int)(rn[2]-r[2]),0,255);
-                        Image -> SetScalarComponentFromDouble(xn+(int)(rn[0]-r[0]),yn+(int)(rn[1]-r[1]),zn+(int)(rn[2]-r[2]),0,255);
-                    }                    
-                }
-            }
-        }
-    }
-
-    vtkSmartPointer<vtkLongArray> Volume = vtkSmartPointer<vtkLongArray>::New();
-    Volume -> SetNumberOfComponents(1);
-    Volume -> SetNumberOfTuples(N);
-
-    // Inside this IF statement, we label all connected components
-    // and we search for those cc that don't have junctions. If any
-    // is found, we force it to have a junction by adding its first
-    // voxel to the list Junctions. This fixes the problem of not
-    // detecting loop-shaped ccs.
-    if (_improve_skeleton_quality) {
-        #ifdef DEBUG
-            printf("Improving skeletonization [step 2: verifying connected components]\n");
-        #endif
-        long int n_fixed = 0;
-        std::vector<long int> CSz;
-        long int cc, ncc = LabelConnectedComponents(Image,Volume,CSz,26,0);
-
-        bool *HasJunction = new bool[ncc];
-        for (cc = ncc; cc--;) HasJunction[cc] = 0;
-        for (id = N; id--;) {
-            Image -> GetPoint(id,r);
-            x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-            cc = (long int)Volume -> GetTuple1(id);
-            if (cc) {
-                if (GetNumberOfNeighborsWithValue(Image,Volume,x,y,z,cc) != 2) {
-                    HasJunction[(unsigned long int)(-cc-1)] = true;
-                }
-            }
-            Image -> SetScalarComponentFromDouble(x,y,z,0,-cc);
-        }
-        for (id = N; id--;) {
-            Image -> GetPoint(id,r);
-            x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-            cc = (long int)Volume -> GetTuple1(id);
-            if (cc) {
-                if (!HasJunction[(unsigned long int)(-cc-1)]) {
-                    HasJunction[(unsigned long int)(-cc-1)] = true;
-                    Junctions.insert(Junctions.begin(),id);
-                    Volume -> SetTuple1(id,junction_label);
-                    junction_label++;
-                    n_fixed++;
-                } else {
-                    Volume -> SetTuple1(id,-1);
-                }
-            } else {
-                Volume -> SetTuple1(id,0);
-            }
-        }
-        delete[] HasJunction;
-
-        #ifdef DEBUG
-            printf("\t#Components fixed = %ld\n",n_fixed);
-        #endif
-
-        Image -> GetPointData() -> GetScalars() -> Modified();
-
-    } else {
-
-        for (id = N; id--;) {
-            if (Image -> GetPointData() -> GetScalars() -> GetTuple1(id)) {
-                Volume -> SetTuple1(id,-1);
-            } else {
-                Volume -> SetTuple1(id,0);
-            }
-        }
-        Volume -> Modified();
-
-    }
-
-    #ifdef DEBUG
-        printf("Starting skeletonization...\n");
-        printf("\tSearching for junctions...\n");
-    #endif
-
-    for (id = N; id--;) {
-        Image -> GetPoint(id,r);
-        x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-        if (Image->GetScalarComponentAsDouble(x,y,z,0)) {
-            if (GetNumberOfNeighborsWithoutValue(Image,x,y,z,0) != 2) {
-                Junctions.insert(Junctions.begin(),id);
-                Volume -> SetTuple1(id,junction_label);
-                junction_label++;
-            }
-        }
-    }
-    Volume -> Modified();
-
-    if (!Junctions.size()) {
-        printf("Z-stack seems to be empty. Aborting...\n");
-        return 0;
-    }
-
-    #ifdef DEBUG
-        printf("\t#Junctions before merging = %ld\n",Junctions.size());
-    #endif
-
-    // MERGING: During the merging process, voxels belonging to
-    // the same junction are merged together forming nodes.
-    while (JunctionsMerge(Junctions,Image,Volume));
-
-    // Listing all nodes label we have until this point
-    std::list<long int> Labels;
-    std::list<long int>::iterator itLabel;
-    for (itId=Junctions.begin(); itId!=Junctions.end(); itId++) {
-        Labels.insert(Labels.begin(),(long int)Volume->GetTuple1(*itId));
-    }
-
-    // UNIQUE of labels
-    Labels.sort(); // must sort first
-    Labels.unique();
-    long int NumberOfNodes = Labels.size();
-
-    #ifdef DEBUG
-        printf("\t#Junctions (nodes) after merging = %ld\n",NumberOfNodes);
-    #endif
-
-    // COORDINATES of nodes
-    // Vectors with static size to make the average calculation easy.
-    long int node;
-    double *X = new double[NumberOfNodes]; //Vector for x-coordinate
-    double *Y = new double[NumberOfNodes]; //Vector for y-coordinate
-    double *Z = new double[NumberOfNodes]; //Vector for z-coordinate
-    double *S = new double[NumberOfNodes]; //Vector for junctions size
-       int *K = new int[NumberOfNodes];    //Vector for junctions degree
-    for (node = 0; node < NumberOfNodes; node++) {
-        K[node] = 0;
-        X[node] = Y[node] = Z[node] = S[node] = 0.0;
-    }
-
-    for (itId=Junctions.begin(); itId!=Junctions.end(); itId++) {
-        junction_label = (long int)Volume -> GetTuple1(*itId);
-        itLabel = std::find(Labels.begin(),Labels.end(),junction_label);
-        node = (long int)std::distance(Labels.begin(),itLabel);
-        Volume -> SetTuple1(*itId,node+1);
-        Image -> GetPoint(*itId,r);
-        X[node] += r[0];
-        Y[node] += r[1];
-        Z[node] += r[2];
-        S[node] ++;
-    }
-    Volume -> Modified();
-
-    // Dynamic list to make easy the insertion of the coordinates
-    // of remaining voxels detected during the edge tracking process.
-    std::list<double> PointsListX;
-    std::list<double> PointsListY;
-    std::list<double> PointsListZ;
-    for (node=0;node<NumberOfNodes;node++) {
-        PointsListX.insert(PointsListX.end(),X[node]/S[node]);
-        PointsListY.insert(PointsListY.end(),Y[node]/S[node]);
-        PointsListZ.insert(PointsListZ.end(),Z[node]/S[node]);
-    }
-
-    delete[] X; delete[] Y; delete[] Z; delete[] S;
-
-    // CellArray to add new edges as they are being tracked.
-    vtkSmartPointer<vtkCellArray> EdgeArray = vtkSmartPointer<vtkCellArray>::New();
-
-    bool _should_add;
-    itId = Junctions.begin();
-    long int voxel_label = NumberOfNodes;
-    long int junction_label_left, junction_label_right;
-    long int source_node, target_node;
-    while (itId != Junctions.end()) {
-        Image -> GetPoint(*itId,r);
-        x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-        if (GetNumberOfNeighborsWithValue(Image,Volume,x,y,z,-1)) {
-            _should_add = true;
-
-            //Tracking new edge
-            std::list<vtkIdType> Edge = GetEdgeStartingAt(x,y,z,Image,Volume);
-
-            //Identifying junctions on left side of the edge
-            source_node = Volume -> GetTuple1(*itId);
-
-            //Identifying junctions on right side of the edge
-            Image -> GetPoint(Edge.back(),r);
-            x = (int)r[0]; y = (int)r[1]; z = (int)r[2];
-            target_node = Volume -> GetTuple1(GetOneNeighborWithoutValue(x,y,z,Image,Volume,source_node));
-
-            // When target_node is equal to 0 at this point, we are
-            // dealing with loops. These loops can be real loops or noise
-            // loops of very small length. This very short loops are often
-            // related to noise around junctions or 1-voxel holes in the
-            // data.
-            // @@PARAMETER: Minimum loop length (in voxels)
-            if (!target_node) {
-                target_node = source_node;
-                if (Edge.size() < 3) _should_add = false;
-            }
-
-            if (_should_add) {
-                // Creating new cell for this edge
-                EdgeArray -> InsertNextCell(Edge.size()+2);
-                // Adding node 1
-                EdgeArray -> InsertCellPoint(source_node-1);
-                // Addint the new points coordinates as well as the edge itself
-                for (std::list<vtkIdType>::iterator itIde=Edge.begin(); itIde!=Edge.end(); itIde++) {
-                    Image -> GetPoint(*itIde,r);
-                    PointsListX.insert(PointsListX.end(),r[0]);
-                    PointsListY.insert(PointsListY.end(),r[1]);
-                    PointsListZ.insert(PointsListZ.end(),r[2]);
-                    EdgeArray -> InsertCellPoint(voxel_label);
-                    voxel_label++;
-                }
-                // Adding node 2
-                EdgeArray -> InsertCellPoint(target_node-1);
-                // Updating nodes degree
-                K[source_node-1]++;
-                K[target_node-1]++;
-            }
-            
-        } else {
-            Junctions.erase(itId++);
-        }
-    }
-
-    vtkSmartPointer<vtkPoints> Points = vtkSmartPointer<vtkPoints>::New();
-    Points -> SetNumberOfPoints(PointsListX.size());
-
-    #ifdef DEBUG
-        printf("#Points in vtkPoints = %lld\n",Points -> GetNumberOfPoints());
-    #endif
-
-    voxel_label = 0;
-    std::list<double>::iterator itX = PointsListX.begin();
-    std::list<double>::iterator itY = PointsListY.begin();
-    std::list<double>::iterator itZ = PointsListZ.begin();
-    while (itX != PointsListX.end()) {
-        Points -> SetPoint(voxel_label,*itX,*itY,*itZ);
-        itX++; itY++; itZ++;
-        voxel_label++;
-    }
-    Points -> Modified();
-
-    PointsListX.clear();
-    PointsListY.clear();
-    PointsListZ.clear();
-
     // Creating raw polyData
     vtkSmartPointer<vtkPolyData> PolyData = vtkPolyData::New();
-    PolyData -> SetPoints(Points);
-    PolyData -> SetLines(EdgeArray);
-    PolyData -> Modified();
-    PolyData -> BuildLinks();
-
-    long int nedges_before_filtering = PolyData -> GetNumberOfCells();
-
-    #ifdef DEBUG
-        printf("\t#Edges before filtering = %ld\n",nedges_before_filtering);
-        SavePolyData(PolyData,(mitoObject->FileName+"_skeleton_raw.vtk").c_str());
-    #endif
-
-    // PolyData filtering by removing degree-2 nodes. These nodes rise
-    // for two reasons: 1) very short edges that are not detected,
-    // although the bifurcation is detected. 2) Short loops that were
-    // removed.
-
-    #ifdef DEBUG
-        printf("\t#Filtering...\n");
-    #endif
-
-    while (
-        MergeEdgesOfDegree2Nodes(PolyData,nedges_before_filtering,K)
-    );
-
-    #ifdef DEBUG
-        printf("\t#Creating new ids...\n");
-    #endif
-
-    //Creating a list with final Ids of nodes after degree-2 nodes
-    //deletetion.
-    long int valid_id = 0;
-    long int *ValidId = new long int[NumberOfNodes];
-    for (node = 0; node < NumberOfNodes; node++) {
-        if (K[node] > 0) {
-            //printf("%d] - k = %d\n",(int)node,(int)K[node]);
-            ValidId[node] = valid_id;
-            valid_id++;
-        } else {
-            ValidId[node] = -1;
-        }
-    }
-
-    #ifdef DEBUG
-        printf("\t#Edges after filtering = %lld\n",PolyData->GetNumberOfCells());
-        printf("Skeletonization done!\n");
-    #endif
-
-    SmoothEdgesCoordinates(PolyData,3);
-
-    if (_export_graph_files) ExportGraphFiles(PolyData,NumberOfNodes,ValidId,mitoObject->FileName.c_str());
-
-    ExportNodes(PolyData,NumberOfNodes,ValidId,mitoObject);
-
     return PolyData;
 }
 
