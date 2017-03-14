@@ -1565,7 +1565,7 @@ int MultiscaleVesselness(_mitoObject *mitoObject) {
     //SAVING SURFACE
     //--------------
 
-    SavePolyData(Surface,(mitoObject->FileName+"_mitosurface.vtk").c_str());
+    // SavePolyData(Surface,(mitoObject->FileName+"_mitosurface.vtk").c_str());
 
 
     //SKELETONIZATION
@@ -1573,6 +1573,7 @@ int MultiscaleVesselness(_mitoObject *mitoObject) {
 
     vtkSmartPointer<vtkPolyData> Skeleton = Thinning3D(Binary,mitoObject);
 
+/*
     //CLEANING POLUDATA
     vtkSmartPointer<vtkCleanPolyData> Clean = vtkSmartPointer<vtkCleanPolyData>::New();
     Clean -> SetInputData(Skeleton);
@@ -1636,7 +1637,7 @@ int MultiscaleVesselness(_mitoObject *mitoObject) {
     //---------------
 
     SavePolyData(Skeleton,(mitoObject->FileName+"_skeleton.vtk").c_str());
-
+*/
     return 0;
 }
 
@@ -1745,7 +1746,7 @@ int main(int argc, char *argv[]) {
         } else {
 
             MultiscaleVesselness(&mitoObject);
-            DumpResults(mitoObject);
+            // DumpResults(mitoObject);
 
         }
 
